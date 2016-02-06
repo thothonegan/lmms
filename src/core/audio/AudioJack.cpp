@@ -38,10 +38,48 @@
 #include "gui_templates.h"
 #include "ConfigManager.h"
 #include "LcdSpinBox.h"
+#include "LedCheckbox.h"
+#include "Song.h"
 #include "AudioPort.h"
 #include "MainWindow.h"
+#include "TimeLineWidget.h"
 
+namespace
+{
+	unsigned long currentFrameTimeForSong (AudioJack* jack, Song* song)
+	{
+		// ms * frames/ms = frames
+		return song->getMilliseconds() * (jack->sampleRate() / 1000.0f);
+	}
 
+	// Called constantly when we're the timebase master and the transport is running.
+	void jackTimeBase (jack_transport_state_t state, jack_nframes_t nframes,
+		jack_position_t* pos, int new_pos, void* arg)
+	{
+		AudioJack* jack = reinterpret_cast<AudioJack*> (arg);
+		Song* s = Engine::getSong();
+
+		// Taken from TimeDisplayWidget
+		int tick = ( s->getMilliseconds() * s->getTempo()
+			* (DefaultTicksPerTact / 4 ) ) / 60000;
+		int measure =  (int)(tick / s->ticksPerTact() ) + 1;
+		int beat = ( tick % s->ticksPerTact() ) /
+						 ( s->ticksPerTact() / s->getTimeSigModel().getNumerator() ) +1;
+		int ticks =  ( tick % s->ticksPerTact() ) %
+					( s->ticksPerTact() / s->getTimeSigModel().getNumerator() );
+
+		// tell jack our current position in bar/beat/ticks + frames
+		pos->valid = JackPositionBBT;
+		pos->bar = measure;
+		pos->beat = beat;
+		pos->tick = ticks;
+		pos->beats_per_bar = s->getTimeSigModel().getNumerator();
+		pos->ticks_per_beat = ticks / beat;
+		pos->beats_per_minute = s->getTempo();
+		pos->beat_type = s->getTimeSigModel().getDenominator();
+		pos->frame = currentFrameTimeForSong(jack, s);
+	}
+}
 
 
 AudioJack::AudioJack( bool & _success_ful, Mixer*  _mixer ) :
@@ -51,6 +89,7 @@ AudioJack::AudioJack( bool & _success_ful, Mixer*  _mixer ) :
 								_mixer ),
 	m_client( NULL ),
 	m_active( false ),
+	m_useTransport( false ),
 	m_tempOutBufs( new jack_default_audio_sample_t *[channels()] ),
 	m_outBuf( new surroundSampleFrame[mixer()->framesPerPeriod()] ),
 	m_framesDoneInCurBuf( 0 ),
@@ -124,6 +163,26 @@ void AudioJack::restartAfterZombified()
 
 
 
+void AudioJack::transportPlaybackStateChanged ()
+{
+	Song* song = Engine::getSong();
+	Song::PlayModes mode = song->playMode();
+
+	if( song->isPlaying() && mode == Song::Mode_PlaySong )
+	{
+		// position transport properly
+		jack_transport_start( m_client );
+	}
+	else if( (song->isStopped() || song->isPaused()) )
+	{
+		jack_transport_stop( m_client );
+		jack_transport_locate( m_client, currentFrameTimeForSong( this, song ));
+	}
+}
+
+
+
+
 bool AudioJack::initJackClient()
 {
 	QString clientName = ConfigManager::inst()->value( "audiojack",
@@ -182,6 +241,23 @@ bool AudioJack::initJackClient()
 			printf( "no more JACK-ports available!\n" );
 			return false;
 		}
+	}
+
+	// Enable the transport if needed
+	m_useTransport = (ConfigManager::inst()->value( "audiojack", "enabletransport" ).toInt() != 0);
+
+	if (m_useTransport)
+	{
+		// we're a timebase master
+		jack_set_timebase_callback (m_client,
+			0 /*unconditional: steal from the current timebase*/, jackTimeBase, this
+		);
+
+		Song* song = Engine::getSong();
+
+		connect( song, SIGNAL(playbackStateChanged()),
+			this, SLOT(transportPlaybackStateChanged())
+		);
 	}
 
 	return true;
@@ -398,6 +474,44 @@ int AudioJack::processCallback( jack_nframes_t _nframes, void * _udata )
 		}
 	}
 
+	// Transport control - only use if we're playing back the full song
+	// (or nothing's happening)
+	// Basically, sync JACK -> LMMS
+	Song* song = Engine::getSong();
+	Song::PlayModes curPlayMode = song->playMode();
+
+	if (m_useTransport && (curPlayMode == Song::Mode_PlaySong
+		|| curPlayMode == Song::Mode_None))
+	{
+		jack_position_t pos;
+		jack_transport_state_t state = jack_transport_query (m_client, &pos);
+
+		// React on external state changes
+		bool isSongPlaying = song->isPlaying();
+
+		if ((state == JackTransportStopped &&  isSongPlaying) ||
+			(state == JackTransportRolling && !isSongPlaying))
+		{
+			// transport changed from what we're doing - trigger to match
+			Song::PlayPos playPos = song->getPlayPos();
+			if (playPos.m_timeLine)
+			{
+				playPos.m_timeLine->pos().setCurrentFrame(pos.frame);
+				playPos.m_timeLine->update();
+			}
+			
+			// start/stop playing
+			if (state == JackTransportRolling)
+			{
+				song->playSong();
+			}
+			else
+			{
+				song->stop();
+			}
+		}
+	}
+
 	return 0;
 }
 
@@ -450,6 +564,12 @@ AudioJack::setupWidget::setupWidget( QWidget * _parent ) :
 	m_channels->setLabel( tr( "CHANNELS" ) );
 	m_channels->move( 180, 20 );
 
+	m_useTransport = new LedCheckBox(tr("Use JACK transport"), this );
+	m_useTransport->move(240, 25);
+
+	bool isTransportEnabled = (ConfigManager::inst()->value(
+		"audiojack", "enabletransport" ).toInt());
+	m_useTransport->setChecked(isTransportEnabled);
 }
 
 
@@ -469,6 +589,9 @@ void AudioJack::setupWidget::saveSettings()
 							m_clientName->text() );
 	ConfigManager::inst()->setValue( "audiojack", "channels",
 				QString::number( m_channels->value<int>() ) );
+	ConfigManager::inst()->setValue( "audiojack", "enabletransport",
+		QString::number( m_useTransport->value<bool>() )
+	);
 }
 
 

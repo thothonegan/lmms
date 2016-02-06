@@ -40,6 +40,7 @@
 
 class QLineEdit;
 class LcdSpinBox;
+class LedCheckBox;
 
 
 class AudioJack : public QObject, public AudioDevice
@@ -67,12 +68,14 @@ public:
 	private:
 		QLineEdit * m_clientName;
 		LcdSpinBox * m_channels;
+		LedCheckBox* m_useTransport;
 
 	} ;
 
 
 private slots:
 	void restartAfterZombified();
+	void transportPlaybackStateChanged();
 
 
 private:
@@ -97,6 +100,7 @@ private:
 
 	bool m_active;
 	bool m_stopped;
+	bool m_useTransport; // if true, we listen/broadcast to the transport
 
 	QVector<jack_port_t *> m_outputPorts;
 	jack_default_audio_sample_t * * m_tempOutBufs;
